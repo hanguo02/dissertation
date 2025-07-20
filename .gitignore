@@ -1,0 +1,6 @@
+.Rhistory
+.RData
+.Rproj.user/
+data_raw/            
+results/plots/*.png
+*.gpkg
