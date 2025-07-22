@@ -8,13 +8,214 @@ date: "2025-07-20"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+## Spatial Clustering for UK 2022 GHG emission 
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+### 1.0 data cleaning-loading packages
+```{r}
+library(readr);    library(dplyr)
+library(sf);       library(spdep)
+library(FactoMineR);library(factoextra)
+library(cluster);  library(tmap)
+tmap_mode("plot")
 ```
+
+### 1.1 reading GHG data for 2022
+```{r}
+
+ghg <- read_csv(
+  "data/2005-2022-local-authority-ghg-emissions-csv-dataset.csv",
+  show_col_types = FALSE
+)
+
+ghg22 <- ghg %>% filter(`Calendar Year` == 2022)
+```
+
+### 1.2 selecting out all sectors I need
+```{r}
+# select out all the sectors 
+# Also I only need the GHG is CO2
+library(dplyr)
+
+target_sectors <- c(
+  "Agriculture",
+  "Industry",
+  "Commercial",
+  "Domestic",
+  "LULUCF",
+  "Public Sector",  
+  "Transport",
+  "Waste"
+)
+
+# filter out GHG == "CO2"
+CO2 <- ghg22 %>%
+  filter(
+    `LA GHG Sector` %in% target_sectors,
+    `Greenhouse gas` == "CO2"
+  )
+
+# summarise all CO2 territorial emission 
+CO2_sum <- CO2 %>%
+  group_by(`Local Authority Code`, `LA GHG Sector`) %>%
+  summarise(kt_CO2 = sum(`Territorial emissions (kt CO2e)`), .groups = "drop")
+
+# turn multi-variable into columns
+library(tidyr)
+CO2_sector <- CO2_sum %>%
+  pivot_wider(names_from = `LA GHG Sector`,
+              values_from = kt_CO2,
+              values_fill  = 0)
+
+CO2emission <- CO2_sector %>%
+  left_join(select(ghg22, `Local Authority`,`Local Authority Code`, `Mid-year Population (thousands)`, `Area (km2)`) %>% distinct(),
+            by = "Local Authority Code") %>%
+  mutate(across(all_of(target_sectors),
+                ~ .x / (`Mid-year Population (thousands)` * 1e3),  # t CO2 / person
+                .names = "{.col}_pc"))
+
+#clean the df
+CO2emission <- CO2emission %>%
+  select(
+    `Local Authority Code`,
+    `Local Authority`,
+    `Mid-year Population (thousands)`,
+    `Area (km2)`,
+    Agriculture,
+    Agriculture_pc,
+    Industry,
+    Industry_pc,
+    Commercial,
+    Commercial_pc,
+    Domestic,
+    Domestic_pc,
+    `Public Sector`,
+    `Public Sector_pc`,
+    Transport,
+    Transport_pc,
+    Waste,
+    Waste_pc,
+    LULUCF,
+    LULUCF_pc
+  )
+
+```
+
+p.s. Here territorial emissions covers all emissions happened in that geographical area
+The subset table is CO2 emissions within the scope of influence of LAs, which Only CO₂ sources that local councils can realistically shape through local policy and services.
+
+###1.3 Loading UK LAD map and merge it with CO2 emission
+```{r}
+# 1. read map
+UKlad <- sf::st_read("data/LAD_boundaries/LAD_MAY_2024_UK_BGC.shp")%>%
+       st_transform(27700)  
+
+lad <- UKlad |>
+  rename(lad_code = LAD24CD,
+         lad_name = LAD24NM) |>    # 方便后面 join 后清晰
+  select(lad_code, lad_name, geometry)
+
+
+CO2emission <- CO2emission %>%
+  rename(lad_code = `Local Authority Code`,
+         lad_name = `Local Authority`,
+         pop_k    = `Mid-year Population (thousands)`,
+         area_km2 = `Area (km2)`
+  )
+
+
+UKemission <- lad %>%                               
+  left_join(CO2emission, by = c("lad_code", "lad_name")) %>%  
+  filter(!if_any(ends_with("_pc"), is.na))             
+
+plot(st_geometry(UKemission), col = "grey")  # 可视化所有区域
+```
+
+### 2.0 spatial weights and clustering
+```{r}
+library(sf);        # 读/写 sf 对象
+library(dplyr);     # 数据整理
+library(cluster);   # silhouette
+library(dbscan);    # DBSCAN
+library(tmap)       # 地图
+
+tmap_mode("plot")   # 想交互改 "view"
+
+sector_pc <- c("Agriculture_pc", "Industry_pc", "Commercial_pc",
+               "Domestic_pc", "Public Sector_pc",
+               "Transport_pc", "Waste_pc", "LULUCF_pc")
+
+X <- UKemission |>
+       st_drop_geometry() |>
+       select(all_of(sector_pc)) |>
+       mutate(across(everything(), ~ replace_na(.x, 0))) |>
+       scale() |>                   # Z-score 标准化
+       as.data.frame()
+
+
+```
+
+```{r}
+sil_vals <- sapply(4:10, function(k){
+  km <- kmeans(X, centers = k, nstart = 50)
+  mean(silhouette(km$cluster, dist(X))[, 3])
+})
+
+best_k <- which.max(sil_vals) + 3   # 因为从 4 开始
+cat("最佳 k =", best_k, "平均 silhouette=", round(sil_vals[best_k-3], 3), "\n")
+
+set.seed(123)
+km_final <- kmeans(X, centers = best_k, nstart = 50)
+UKemission$kmeans_cl <- factor(km_final$cluster)
+
+```
+
+DBSCAN
+```{r}
+kNNdistplot(X, k =  8)             # 8 ≈ 2×维度，对应常用 minPts
+abline(h = 0.25, col = "red")      # 0.25 只是示例；看拐点自定
+
+db <- dbscan(X, eps = 0.25, minPts = 8)
+table(db$cluster)                  # 0 表示噪声
+UKemission$dbscan_cl <- factor(db$cluster)
+
+```
+画图
+```{r}
+table(UKemission$kmeans_cl)
+
+centroids <- UKemission |>
+  st_drop_geometry() |>
+  group_by(kmeans_cl) |>
+  summarise(across(all_of(sector_pc), mean)) |>
+  arrange(kmeans_cl)
+
+print(centroids, n = Inf)
+
+write.csv(centroids,
+          file = "results/kmeans_centroids.csv",
+          row.names = FALSE)
+
+```
+
+```{r}
+
+tm <- tm_shape(UKemission) +
+        tm_fill("kmeans_cl",
+                palette = "Set3",
+                title   = "k-means (k = 5)") +
+        tm_borders(col = "grey50", lwd = 0.2)
+
+tmap_save(tm,
+          filename = "results/kmeans_map.png",
+          dpi       = 300,          # 分辨率：300 dpi 适合论文/幻灯片
+          width     = 2000,         # 像素宽度
+          height    = 3000)         # 像素高度
+
+```
+
+
+
+
+
 
