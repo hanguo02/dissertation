@@ -1,0 +1,17 @@
+.Rhistory
+.RData
+.Rproj.user/
+data_raw/            
+results/plots/*.png
+*.gpkg
+.DS_Store
+# 忽略大数据文件
+*.geojson
+*.RDataTmp
+*.RData
+*.shp
+*.shx
+*.dbf
+*.pdf
+results/
+spatial_autocorrelation/epc_autocorrelation/

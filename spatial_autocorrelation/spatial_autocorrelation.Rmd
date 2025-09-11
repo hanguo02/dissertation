@@ -1,0 +1,332 @@
+---
+title: "spatial_autocorrelation"
+output: html_document
+date: "2025-08-13"
+---
+
+
+### This R Markdown is spatial autocorrelation for domestic CO2 emission ( revealing spatial pattern of CO2 emission )
+```{r}
+library(sf)
+library(dplyr)
+library(readr)
+library(janitor)
+library(stringr)
+library(spdep)
+```
+
+### 1. Cleaning Data and preparing the autocorrelation-panel
+```{r}
+
+# —— file path define —— #
+geojson_path <- "data/Local_Authority_Districts_May_2024_Boundaries_UK_BFC_-6788913184658251542.geojson"    # 替换成你的 GeoJSON 路径
+CO2_path <- "data/2005-23-uk-local-authority-ghg-emissions-CSV-dataset.csv"
+
+# —— left_join column name—— #
+panel_code_col <- "ladcode"   # 面板数据里的 LAD 编码字段
+geojson_code_col <- "LAD24CD"  # GeoJSON 里的 LAD 编码字段（如 LAD24CD）
+
+# —— read in data —— #
+geo_sf   <- read_sf(geojson_path)
+CO2_df <- read_csv(CO2_path)
+
+domestic_2023 <- CO2_df %>%
+  filter(year == 2023,
+         sector == "Domestic",
+         toupper(ghg) == "CO2") %>%
+  group_by(ladcode) %>%
+  summarise(
+    region     = first(Region),
+    year       = first(year),
+    mid_year_pop_1000 = first(`mid-year-population(1000)`),
+    area_km2   = first(`Area (km2)`),
+    territorial_emission_kt = sum(`territorial_emission(kt CO2e)`, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(co2_density = territorial_emission_kt / area_km2)  # 单位：kt/km²
+
+write_csv(domestic_2023, "data/domestic_co2_2023.csv")
+
+
+```
+
+
+###2.0 Looking at basic spatial pattern of CO2 emission (density of co2 per area in uk)
+```{r}
+library(sf)
+library(dplyr)
+library(tmap)
+
+
+# 假设 geo_sf 是你的边界文件，含 LAD24CD 和 geometry
+map_sf <- geo_sf %>%
+  select(ladcode = LAD24CD, geometry) %>%
+  left_join(domestic_2023, by = "ladcode") %>%
+  st_as_sf()
+
+library(tmap)
+tmap_mode("plot")
+
+m<-tm_shape(map_sf) +
+  tm_fill("co2_density",
+          style = "quantile", n = 5,
+          palette = "Purples",
+          title = "Domestic CO₂ Emission Density\n(kt/km²)",
+          colorNA = "grey85",     # 保留边界
+          textNA = "No data") +   # 图例文字
+  tm_borders(col = "grey40", lwd = 0.1)+
+  tm_layout(frame = FALSE)
+
+
+tmap_save(m, filename = "co2_density_domestic_2023.png", width = 2200, height = 2200, dpi = 500)
+```
+
+### 1.3 domestic CO2 trend
+```{r}
+library(dplyr)
+
+domestic_ts <- CO2_df %>%
+  filter(sector == "Domestic", toupper(ghg) == "CO2") %>%
+  group_by(year) %>%
+  summarise(total_kt = sum(`territorial_emission(kt CO2e)`, na.rm = TRUE))
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(scales)  # 确保你加载了这个包
+
+# 1. 先处理数据（kt → Mt）
+domestic_ts <- domestic_ts %>%
+  mutate(emission_mt = total_kt / 1000)
+
+# 2. 绘图
+ggplot(domestic_ts, aes(x = year, y = emission_mt)) +
+  geom_line(color = "mediumpurple", size = 1) +
+  geom_point(color = "mediumpurple", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed", color = "grey50") +
+
+  # X轴每年一个刻度
+  scale_x_continuous(
+    breaks = seq(2005, 2023, by = 2)
+  ) +
+
+  # Y轴单位：Mt
+  scale_y_continuous(
+    name = "Territorial CO₂ Emissions (Mega tonnes)",
+    labels = function(x) paste0(x, " Mt")  # 或者使用 label_number()
+  ) +
+
+  # 美化主题和坐标轴线
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(colour = "grey50"),
+    axis.ticks = element_line(colour = "grey50")
+  ) +
+
+  labs(
+    title = "UK Domestic CO₂ Emissions (2005–2023)",
+    x = "Year",
+    caption = "Source: BEIS / LA GHG Inventory"
+  )
+
+ggsave("domestic_co2_trend_2005_2023.png", width = 8, height = 5, dpi = 300)
+
+```
+
+
+### 3.0 autocorrelation of domestic CO2
+```{r}
+library(sf)
+library(dplyr)
+library(stringr)
+library(spdep)
+
+var_key  <- "ladcode"
+var_emis <- "territorial_emission_kt"   # <— 如果不是这个名，改成你的列名
+
+# 2) 键值统一清洗（去空格、转大写；防止 join 因“脏字符串/旧新代码”对不上）
+geo_sf <- geo_sf %>% mutate(ladcode = toupper(str_trim(ladcode)))
+domestic_2023 <- domestic_2023 %>%
+  mutate(ladcode = toupper(str_trim(!!sym(var_key))),
+         co2_per_1000p = territorial_emission_kt / mid_year_pop_1000) %>%
+  distinct(ladcode, .keep_all = TRUE)
+
+# 3) 合并（左连：保留全部 LAD，多出来的排放缺失留 NA）
+co2_panel <- geo_sf %>% left_join(domestic_2023, by = "ladcode")
+
+# （可选）审计哪些 LAD 在 domestic 里没有值，方便你后续补录/核对
+missing_in_dom <- co2_panel %>% st_drop_geometry() %>% filter(is.na(.data[[var_emis]]))
+n_missing <- nrow(missing_in_dom)
+message("合并成功。缺失排放值的 LAD 数量：", n_missing)
+
+
+co2_clean <- co2_clean %>%
+  rename(
+      ladname = LAD24NM    # 现在新增的
+  )
+```
+
+
+### 1.4. kNN autocorrelation analysis： Global Moran's I
+```{r}
+library(sf)
+library(dplyr)
+library(spdep)
+
+
+# ------------------------------------------------
+# 2) 构建 kNN 邻接（每个 LAD 至少有 k 个邻居，避免孤岛）
+# ------------------------------------------------
+coords <- st_coordinates(st_centroid(co2_clean))
+nb_knn <- knn2nb(knearneigh(coords, k = 4))   # 这里选 k=4，你可以调成 5 或 6 做稳健性
+lw_knn <- nb2listw(nb_knn, style = "W", zero.policy = TRUE)
+
+# ------------------------------------------------
+# 3) Global Moran’s I
+# ------------------------------------------------
+valid <- which(!is.na(co2_clean$co2_per_1000p))
+x <- co2_clean$co2_per_1000p[valid]
+
+# 直接在子集几何上重算 kNN（最省事、最稳）
+coords_sub <- st_coordinates(st_centroid(st_geometry(co2_clean[valid, ])))
+nb_sub  <- knn2nb(knearneigh(coords_sub, k = 4))
+lw_sub  <- nb2listw(nb_sub, style = "W", zero.policy = TRUE)
+
+moran_global <- moran.test(x, lw_sub, zero.policy = TRUE)
+print(moran_global)
+```
+
+### 1.5. Performing permutation tests is more robust (avoiding normal approximation bias).
+```{r}
+moran_perm <- moran.mc(x, lw_sub, nsim = 999, alternative = "greater", zero.policy = TRUE)
+moran_perm
+
+```
+
+```{r}
+# --- packages ---
+library(sf)
+library(dplyr)
+library(spdep)
+library(tmap)      # 若想用 ggplot，下面也给了可选代码
+
+
+# 1) Local Moran's I（用现成的 lw_sub & x）
+lm    <- localmoran(x, lw_sub, zero.policy = TRUE)   # Ii, E.Ii, Var.Ii, Z.Ii, Pr(z > 0)
+Ii    <- lm[, 1]
+pval  <- lm[, 5]
+lag_x <- lag.listw(lw_sub, x, zero.policy = TRUE)
+xbar  <- mean(x)
+alpha <- 0.05
+
+# 2) 生成 LISA 簇标签（四象限 + 不显著）
+lab_vec <- dplyr::case_when(
+  x >= xbar & lag_x >= xbar & pval < alpha ~ "High-High",
+  x <= xbar & lag_x <= xbar & pval < alpha ~ "Low-Low",
+  x >= xbar & lag_x <  xbar & pval < alpha ~ "High-Low",
+  x <  xbar & lag_x >= xbar & pval < alpha ~ "Low-High",
+  TRUE                                    ~ "Not significant"
+)
+
+# 4) 写回到 原来的（与原顺序对齐）
+lad_lisa <- co2_clean
+lad_lisa$Ii     <- NA_real_
+lad_lisa$Pr_Ii  <- NA_real_
+lad_lisa$Lag_x  <- NA_real_
+lad_lisa$LISA   <- factor("Not significant",
+                          levels = c("High-High","Low-Low","High-Low","Low-High","Not significant"))
+
+lad_lisa$Ii[valid]    <- Ii
+lad_lisa$Pr_Ii[valid] <- pval
+lad_lisa$Lag_x[valid] <- lag_x
+lad_lisa$LISA[valid]  <- factor(lab_vec,
+                                levels = c("High-High","Low-Low","High-Low","Low-High","Not significant"))
+
+```
+
+
+
+
+### 1.6. map out the lisa
+```{r}
+# 5) 画 LISA 聚类图（直接出图）
+tmap_mode("view")
+pal <- c("High-High" = "#b2182b", "Low-Low" = "#2166ac",
+         "High-Low" = "#ef8a62", "Low-High" = "#67a9cf",
+         "Not significant" = "grey85")
+
+map_lisa <- tm_shape(lad_lisa) +
+  tm_fill("LISA", title = "LISA clusters (p < 0.05)", palette = pal, legend.is.portrait = TRUE) +
+  tm_borders(col = "grey40", lwd = 0.1) +
+  tm_layout(frame = FALSE, legend.outside = TRUE, legend.outside.position = "right")
+map_lisa
+
+# （可选）导出
+ tmap_save(map_lisa, "lisa_clusters.png", width = 2000, height = 2800, dpi = 500)
+# sf::st_write(lad_lisa, "lisa_clusters.gpkg", layer = "LISA", delete_layer = TRUE)
+```
+
+
+
+###FDR: Benjamini-Hochberg test
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(sf)
+library(spdep)
+library(tmap)
+
+alpha <- 0.05
+lm <- localmoran(x, lw_sub, zero.policy = TRUE)
+p_raw <- lm[,5]
+p_adj <- p.adjust(p_raw, method = "BH")  # FDR
+
+xbar  <- mean(x); lagx <- lag.listw(lw_sub, x, zero.policy = TRUE)
+lab_bh <- dplyr::case_when(
+  x >= xbar & lagx >= xbar & p_adj < alpha ~ "High-High",
+  x <= xbar & lagx <= xbar & p_adj < alpha ~ "Low-Low",
+  x >= xbar & lagx <  xbar & p_adj < alpha ~ "High-Low",
+  x <  xbar & lagx >= xbar & p_adj < alpha ~ "Low-High",
+  TRUE ~ "Not significant"
+)
+lad_lisa$LISA_BH <- NA_character_; lad_lisa$LISA_BH[valid] <- lab_bh
+
+# 写回 sf
+lad_bh <- co2_clean
+lad_bh$LISA_BH <- NA_character_
+lad_bh$LISA_BH[valid] <- lab_bh
+lad_bh$Pr_Ii_BH <- NA_real_
+lad_bh$Pr_Ii_BH[valid] <- p_adj
+
+# 2) 打上“苏格兰”标记（LAD24CD/LAD code 以 S* 开头的是苏格兰）
+lad_bh <- lad_bh %>%
+  mutate(is_scotland = str_starts(ladcode, "S"))
+
+# 3) 画 BH 调整后的 LISA 图
+tmap_mode("plot")
+pal <- c("High-High"="#b2182b","Low-Low"="#2166ac",
+         "High-Low"="#ef8a62","Low-High"="#67a9cf",
+         "Not significant"="grey85")
+
+map_bh <-tm_shape(lad_bh) +
+  tm_fill("LISA_BH", palette = pal, title = "LISA (BH-adjusted p < 0.05)") +
+  tm_borders(col="grey40", lwd=0.1) +
+  tm_layout(frame=FALSE, legend.outside=TRUE)
+
+tmap_save(map_bh, "lisa_clusters_bhtest.png", width = 2000, height = 2800, dpi = 500)
+
+# 4) 量化：苏格兰是否“集中”为 High–High？
+# 4.1 计数表（苏格兰 vs 非苏格兰，各簇数量）
+tab_counts <- lad_bh %>%
+  st_drop_geometry() %>%
+  filter(!is.na(LISA_BH)) %>%
+  count(is_scotland, LISA_BH) %>%
+  pivot_wider(names_from = LISA_BH, values_from = n, values_fill = 0)
+print(tab_counts)
+
+```
+

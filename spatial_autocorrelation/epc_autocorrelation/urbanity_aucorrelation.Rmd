@@ -1,0 +1,95 @@
+------------------------------------------------------------------------
+
+title: "urbanity_autocorrelation"
+
+
+###1.0 cleaning data
+```{r}
+library(readr)
+library(dplyr)
+library(janitor)
+library(sf)
+library(spdep)
+library(sfdep)     # 用于 (双变量) 局部 Moran
+library(tmap)
+set.seed(2023)
+
+# 1. read in saved dataset in last step
+epc_path <- "epc_panel.csv"
+
+epc <- read_csv(epc_path, show_col_types = FALSE) |>
+  clean_names() |>
+  mutate(ladcode = as.character(ladcode),
+         year    = as.integer(year))
+
+epc <- epc |>
+  mutate(
+    pct_efg   = pct_e + pct_f + pct_g,
+    pct_abcd  = pct_a + pct_b + pct_c + pct_d,
+    pct_bcd   = pct_b + pct_c + pct_d
+  )
+
+geo_sf <-  st_read("Local_Authority_Districts_May_2024_Boundaries_UK_BFC_-6788913184658251542.geojson")
+
+
+library(dplyr)
+geo_sf <- geo_sf %>%
+  rename(ladcode = LAD24CD)
+
+g <- geo_sf |> left_join(epc, by = "ladcode")
+urbanity_panel <- g |>
+  select(ladcode, co2_per_1000p, urbanity,pct_efg, geometry, pct_bcd,)
+
+```
+
+
+
+```{r}
+# 1) preparing the dataset
+g <- g |>
+  st_make_valid() |>
+  filter(!is.na(urbanity), !is.na(co2_per_1000p))
+urbanity_panel <- g |>
+  select(ladcode, co2_per_1000p, urbanity,pct_efg, geometry, pct_bcd,)
+
+# 2) kNN=4
+coords <- st_coordinates(st_centroid(st_geometry(urbanity_panel)))
+nb <- knn2nb(knearneigh(coords, k = 4))
+lw <- nb2listw(nb, style = "W")
+
+# 2. checking all variables are available
+valid <- !is.na(urbanity_panel$co2_per_1000p) & !is.na(urbanity_panel$urbanity)
+
+# 3. standardise all 
+y <- scale(urbanity_panel$co2_per_1000p[valid])[,1]
+x <- scale(urbanity_panel$urbanity[valid])[,1]
+
+# 4. creating spatial weights 
+nb_sub <- spdep::subset.nb(nb, subset = valid)
+lw_sub <- nb2listw(nb_sub, style = "W")
+
+
+lag_x <- spdep::lag.listw(lw_sub, x, zero.policy = TRUE)
+
+
+
+```
+
+
+```{r}
+# === 1) 全局双变量 Moran's I：I_xy = (n/S0) * sum( y_i * sum_j w_ij x_j ) ===
+nsim <- 999
+n  <- sum(valid); S0 <- spdep::Szero(lw_sub)
+I_obs <- (n / S0) * sum(y * lag_x)
+
+I_perm <- replicate(nsim, {
+  x_perm <- sample(x, replace = FALSE)
+  lag_perm <- spdep::lag.listw(lw_sub, x_perm, zero.policy = TRUE)
+  (n / S0) * sum(y * lag_perm)
+})
+p_perm <- (sum(abs(I_perm) >= abs(I_obs)) + 1) / (nsim + 1)
+cat(sprintf("Global bivariate Moran's I (CO2 ~ lag(urbanity)): I_xy = %.3f, perm p = %.4f\n",
+            I_obs, p_perm))
+
+```
+

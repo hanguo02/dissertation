@@ -1,0 +1,13 @@
+*.tif
+*.rds
+*.gpkg
+*.csv
+*.zip
+*.log
+*.ipynb_checkpoints/
+__pycache__/
+data/
+output/
+.DS_Store
+.DS_Store
+data_cleaning/spatial_autocorrelation/data/panel_with_geometry.gpkg

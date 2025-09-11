@@ -1,0 +1,445 @@
+---
+title: "spatial_clustering"
+output: html_document
+date: "2025-07-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Spatial Clustering for UK 2022 GHG emission 
+
+
+### 1.0 data cleaning-loading packages
+```{r}
+library(readr);    library(dplyr)
+library(sf);       library(spdep)
+library(FactoMineR);library(factoextra)
+library(cluster);  library(tmap)
+tmap_mode("plot")
+```
+
+### 1.1 reading GHG data for 2022
+```{r}
+
+ghg <- read_csv(
+  "data/2005-2022-local-authority-ghg-emissions-csv-dataset.csv",
+  show_col_types = FALSE
+)
+
+ghg22 <- ghg %>% filter(`Calendar Year` == 2022)
+```
+
+### 1.2 selecting out all sectors I need
+```{r}
+# select out all the sectors 
+# Also I only need the GHG is CO2
+library(dplyr)
+
+target_sectors <- c(
+  "Agriculture",
+  "Industry",
+  "Commercial",
+  "Domestic",
+  "LULUCF",
+  "Public Sector",  
+  "Transport",
+  "Waste"
+)
+
+# filter out GHG == "CO2"
+CO2 <- ghg22 %>%
+  filter(
+    `LA GHG Sector` %in% target_sectors,
+    `Greenhouse gas` == "CO2"
+  )
+
+# summarise all CO2 territorial emission 
+CO2_sum <- CO2 %>%
+  group_by(`Local Authority Code`, `LA GHG Sector`) %>%
+  summarise(kt_CO2 = sum(`Territorial emissions (kt CO2e)`), .groups = "drop")
+
+# turn multi-variable into columns
+library(tidyr)
+CO2_sector <- CO2_sum %>%
+  pivot_wider(names_from = `LA GHG Sector`,
+              values_from = kt_CO2,
+              values_fill  = 0)
+
+CO2emission <- CO2_sector %>%
+  left_join(select(ghg22, `Local Authority`,`Local Authority Code`, `Mid-year Population (thousands)`, `Area (km2)`) %>% distinct(),
+            by = "Local Authority Code") %>%
+  mutate(across(all_of(target_sectors),
+                ~ .x / `Mid-year Population (thousands)`,  # t CO2 / person
+                .names = "{.col}_p1000"))
+
+#clean the df
+CO2emission <- CO2emission %>%
+  select(
+    `Local Authority Code`,
+    `Local Authority`,
+    `Mid-year Population (thousands)`,
+    `Area (km2)`,
+    Agriculture,
+    Agriculture_p1000,
+    Industry,
+    Industry_p1000,
+    Commercial,
+    Commercial_p1000,
+    Domestic,
+    Domestic_p1000,
+    `Public Sector`,
+    `Public Sector_p1000`,
+    Transport,
+    Transport_p1000,
+    Waste,
+    Waste_p1000,
+    LULUCF,
+    LULUCF_p1000
+  )
+
+```
+
+p.s. Here territorial emissions covers all emissions happened in that geographical area
+The subset table is CO2 emissions within the scope of influence of LAs, which Only CO₂ sources that local councils can realistically shape through local policy and services.
+
+###1.3 Loading UK LAD map and merge it with CO2 emission
+```{r}
+# 1. read map
+UKlad <- sf::st_read("data/LAD_boundaries/LAD_MAY_2024_UK_BGC.shp")%>%
+       st_transform(27700)  
+
+lad <- UKlad |>
+  rename(lad_code = LAD24CD,
+         lad_name = LAD24NM) |>    # 方便后面 join 后清晰
+  select(lad_code, lad_name, geometry)
+
+
+CO2emission <- CO2emission %>%
+  rename(lad_code = `Local Authority Code`,
+         lad_name = `Local Authority`,
+         pop_k    = `Mid-year Population (thousands)`,
+         area_km2 = `Area (km2)`
+  )
+
+
+UKemission <- lad %>%                               
+  left_join(CO2emission, by = c("lad_code", "lad_name")) %>%  
+  filter(!if_any(ends_with("_p1000"), is.na))    
+
+sf::st_write(UKemission, "results/UKemission.gpkg", delete_dsn = TRUE)
+
+
+```
+
+### 2.0 spatial weights and clustering
+```{r}
+library(sf);        # 读/写 sf 对象
+library(dplyr);     # 数据整理
+library(cluster);   # silhouette
+library(dbscan);    # DBSCAN
+library(tmap)       # 地图
+
+tmap_mode("plot")   # 想交互改 "view"
+
+sector_p1000 <- c("Agriculture_p1000", "Industry_p1000", "Commercial_p1000",
+               "Domestic_p1000", "Public Sector_p1000",
+               "Transport_p1000", "Waste_p1000", "LULUCF_p1000")
+
+X <- UKemission |>
+       st_drop_geometry() |>
+       select(all_of(sector_p1000)) |>
+       mutate(across(everything(), ~ replace_na(.x, 0))) |>
+       scale() |>                   # Z-score 标准化
+       as.data.frame()
+
+
+
+```
+
+```{r}
+set.seed(42)
+sil_vals <- sapply(4:10, function(k){
+  km <- kmeans(X, centers = k, nstart = 50)
+  mean(silhouette(km$cluster, dist(X))[, 3])
+})
+
+best_k <- which.max(sil_vals) + 3   # 因为从 4 开始
+cat("最佳 k =", best_k, "平均 silhouette=", round(sil_vals[best_k-3], 3), "\n")
+
+set.seed(99)
+km_final <- kmeans(X, centers = best_k, nstart = 50)
+UKemission$kmeans_cl <- factor(km_final$cluster)
+
+```
+
+DBSCAN
+```{r}
+kNNdistplot(X, k =  16)             # 8 ≈ 2×维度，对应常用 minPts
+abline(h = 3.5, col = "red")      # 0.25 只是示例；看拐点自定
+
+db <- dbscan(X, eps = 3.5, minPts = 16)
+table(db$cluster)                  # 0 表示噪声
+UKemission$dbscan_cl <- factor(db$cluster)
+
+
+
+```
+### 1.3. kmean=5时，cluster表格
+```{r}
+table(UKemission$kmeans_cl)
+
+centroids <- UKemission |>
+  st_drop_geometry() |>
+  group_by(kmeans_cl) |>
+  summarise(
+    n_LAD   = n(),                    # 先算数量
+    across(all_of(sector_p1000), mean)
+  ) |>
+  arrange(kmeans_cl) |>
+  mutate(across(all_of(sector_p1000), round, 2))
+
+
+
+
+print(centroids, n = Inf)
+
+write.csv(centroids,
+          file = "results/kmeans_centroids.csv",
+          row.names = FALSE) 
+
+```
+
+
+### 1.3.2 kmean=5时，cluster map
+```{r}
+UK_map <-
+ tm_shape(UKemission) +
+        tm_fill("kmeans_cl",
+                palette = "Set3",
+                title   = "k-means (k = 5)") +
+        tm_borders(col = "grey50", lwd = 1)+
+        tm_layout(legend.title.size = 1.5,   # 图例标题放大
+            legend.text.size  = 2) 
+
+
+tmap_save(UK_map, "results/UK_kmeans_print.pdf",
+         width = 50, height = 50, units = "cm")
+
+```
+```{r}
+london_bbox <- st_bbox(c(xmin = -0.55, xmax = 0.30,
+                         ymin = 51.20, ymax = 51.80),
+                       crs = 4326)
+
+#—— ❷ 画图：裁剪 + 放大 + 调整图例字号                         ----
+london_map <- 
+tm_shape(UKemission, bbox = london_bbox) +       # ← 只显示伦敦
+  tm_fill("kmeans_cl",
+          palette = "Set3",
+          title   = "k-means (k = 5)") +
+  tm_borders(col = "grey50", lwd = 1) +
+  tm_layout(legend.title.size = 1.4,   # 图例标题放大
+            legend.text.size  = 1.2)   # 图例内容放大
+
+tmap_save(london_map, "results/london_kmeans_print.pdf",
+          width = 17, height = 22, units = "cm")
+```
+
+### 2.1 Running Silhouette and Gap, and draw PCA
+```{r}
+## ------------ 前期准备 ------------
+library(sf)
+library(cluster)      # silhouette()
+library(factoextra)   # fviz_ 系列
+library(FactoMineR)   # PCA()
+library(ggplot2)
+library(ggrepel)
+
+set.seed(123)          # 可复现
+
+# 假设 UKemission 里已经有 kmeans_cl 这个因子列
+df  <- UKemission |>
+  st_drop_geometry() |>
+  mutate(across(all_of(sector_p1000), scale))        # 标准化用于 silhouette / PCA
+
+## ----------------------------------
+## 1) Silhouette plot
+## ----------------------------------
+## ---- 重新生成 silhouette 对象 ----
+cl_vec    <- as.integer(df$kmeans_cl)              # ← 把 factor 变成 1,2,3...
+dist_mat  <- dist(select(df, all_of(sector_p1000))) # 距离矩阵保持不动
+
+sil       <- silhouette(cl_vec, dist_mat)
+
+p_sil <- fviz_silhouette(sil) +
+  ggtitle("Silhouette Plot for k-means (k = 5)")
+
+ggsave("silhouette_k5.png", p_sil, width = 7, height = 5, dpi = 300)
+
+
+## ----------------------------------
+## 2) Gap Statistic
+## ----------------------------------
+gap <- clusGap(select(df, all_of(sector_p1000)),
+               FUNcluster = kmeans,
+               K.max = 10,  # 想测试到多少簇
+               B = 300)     # bootstrap 次数
+
+p_gap <- fviz_gap_stat(gap) + ggtitle("Gap Statistic")
+
+ggsave("results/gap_statistic222.png", p_gap, width = 7, height = 5, dpi = 300)
+
+## ----------------------------------
+## ----------------------------------
+## 3) PCA scatter, colored by cluster
+##    并高亮簇 3 (n = 1) 和簇 5 (n = 4)
+## ----------------------------------
+# ① 做 PCA（无图）
+pca_res <- PCA(select(df, all_of(sector_p1000)), graph = FALSE)
+
+# ② 把前两主成分 + 聚类标签收进 tibble
+pca_df <- as.data.frame(pca_res$ind$coord[, 1:2]) |>
+  dplyr::rename(PC1 = Dim.1, PC2 = Dim.2) |>
+  dplyr::mutate(
+    LAD     = rownames(df),        # LAD 名
+    cluster = df$kmeans_cl         # 原来 factor，就保留 factor
+  )
+
+# ③ 画散点 + 椭圆
+library(ggplot2)
+library(ggrepel)
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, fill = cluster)) +
+  geom_point(shape = 21, size = 2, alpha = 0.8, colour = "black") +
+  stat_ellipse(aes(colour = cluster), type = "norm", level = 0.95, linetype = 2) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  labs(
+    title = "PCA of Sector Emissions (colored by cluster)",
+    fill  = "Cluster"
+  ) +
+  theme_minimal(base_size = 13)
+
+# ④ 给簇 3 & 5 的 LAD 打标签
+p_pca <- p_pca +
+  geom_text_repel(
+    data = subset(pca_df, cluster %in% c(3, 5)),
+    aes(label = LAD),
+    size = 3,
+    box.padding = 0.4,
+    min.segment.length = 0
+  )
+
+ggsave("results/pca_clusters222.png", p_pca, width = 7, height = 5, dpi = 300)
+
+out_id  <- which(df$kmeans_cl %in% c(1, 3, 5))   # 单点 & n=4 小簇
+core_df <- df[-out_id, ]                          # 主干 300+ LAD
+
+UKemission$lad_name[out_id]
+```
+
+### 2.2 After get rid of the outliers, checking the best k and re-cluster the results (core-df)
+```{r}
+## ---------------------------------------------------------
+## 0. Which are the clusters, which are outliers？
+## ---------------------------------------------------------
+outlier_clusters <- c(1, 3, 5)       
+
+
+## ---------------------------------------------------------
+## 1.  core_df （get rid of outlier LAD）
+## ---------------------------------------------------------
+core_df <- UKemission |>
+  filter(!(kmeans_cl %in% outlier_clusters)) |>
+  st_drop_geometry()                  
+
+# standardise
+core_scaled <- core_df |>
+  mutate(across(all_of(sector_p1000), scale))
+
+## ---------------------------------------------------------
+## 2. select k, (k=2 to k=4)
+## ---------------------------------------------------------
+library(factoextra)
+
+set.seed(123)
+fviz_nbclust(select(core_scaled, all_of(sector_p1000)),
+             kmeans, method = "silhouette",
+             k.max = 6, nstart = 30) +
+  ggtitle("Silhouette method on core_df")
+
+
+gap_core <- clusGap(select(core_scaled, all_of(sector_p1000)),
+                    FUNcluster = kmeans, K.max = 6, B = 300)
+fviz_gap_stat(gap_core) + ggtitle("Gap Statistic on core_df")
+
+## ---------------------------------------------------------
+## 3. 跑 k-means（先 k = 2，再视情况 k = 3）
+## ---------------------------------------------------------
+set.seed(123)
+km_core2 <- kmeans(select(core_scaled, all_of(sector_p1000)), centers = 2, nstart = 30)
+km_core3 <- kmeans(select(core_scaled, all_of(sector_p1000)), centers = 3, nstart = 30)
+
+## ---------------------------------------------------------
+## 4. return the result to core_df
+## ---------------------------------------------------------
+core_df$k2 <- factor(km_core2$cluster)
+core_df$k3 <- factor(km_core3$cluster)
+
+## ---------------------------------------------------------
+## 5. Visualise
+## 5a. silhouette for k = 2 / 3
+## ---------------------------------------------------------
+library(cluster)
+sil_k2 <- silhouette(as.integer(core_df$k2),
+                     dist(select(core_scaled, all_of(sector_p1000))))
+sil_k3 <- silhouette(as.integer(core_df$k3),
+                     dist(select(core_scaled, all_of(sector_p1000))))
+
+fviz_silhouette(sil_k2) + ggtitle("Silhouette (k = 2, core_df)")
+fviz_silhouette(sil_k3) + ggtitle("Silhouette (k = 3, core_df)")
+
+## 5b. PCA scatter（再上色）
+pca_core <- PCA(select(core_scaled, all_of(sector_p1000)), graph = FALSE)
+pca_df   <- as.data.frame(pca_core$ind$coord[, 1:2]) |>
+  rename(PC1 = Dim.1, PC2 = Dim.2) |>
+  mutate(k2 = core_df$k2,
+         k3 = core_df$k3)
+
+ggplot(pca_df, aes(PC1, PC2, fill = k2)) +
+  geom_point(shape = 21, size = 2, colour = "black") +
+  stat_ellipse(aes(colour = k2), type = "norm", level = 0.95, linetype = 2) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_colour_brewer(palette = "Set1", guide = "none") +
+  theme_minimal(base_size = 13) +
+  labs(title = "PCA on core_df (k = 2)")
+
+## ---------------------------------------------------------
+## 6. looking at centroids at each clusters and number of LADs
+## ---------------------------------------------------------
+library(dplyr)
+
+centroids_k2 <- core_df |>
+  group_by(k2) |>
+  summarise(
+    n_LAD = n(),
+    across(all_of(sector_p1000), mean, .names = "{.col}_mean")
+  )
+
+centroids_k3 <- core_df |>
+  group_by(k3) |>
+  summarise(
+    n_LAD = n(),
+    across(all_of(sector_p1000), mean, .names = "{.col}_mean")
+  )
+
+print(centroids_k2, n = Inf)
+print(centroids_k3, n = Inf)
+
+```
+
+
+
+
